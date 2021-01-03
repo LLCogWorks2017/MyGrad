@@ -71,13 +71,165 @@ class GetItem(Operation):
 
     def backward_var(self, grad, index, **kwargs):
         a = self.variables[index]
-        out = np.zeros_like(a.data)
-        if self._used_distinct_indices:
-            out[self.index] += grad
+        inds = self.index
+
+        if self._used_distinct_indices or grad.size == 0:
+            out = np.zeros_like(a.data)
+            out[inds] += grad
         else:
-            # although `add.at` will work for all cases, it is
-            # a very slow function: https://github.com/numpy/numpy/issues/5922
-            np.add.at(out, self.index, grad)
+            # used non-purely-boolean advanced indexing
+            inds = list(inds)
+
+            # tally of how many of each object appear in index
+            num_bool_arr = 0
+            num_int_arr = 0
+            num_none = 0
+            num_int = 0
+            ell_ind = -1
+
+            # used to determine whether all integer array indices are next to one another or not
+            # and if not, where indices must be inserted for broadcast compatibility
+            pos_int_arr = []
+
+            # tally objects
+            for j, ind in enumerate(inds):
+                if isinstance(ind, slice):
+                    continue
+                elif isinstance(ind, int):
+                    num_int += 1
+                    continue
+                elif ind is None:
+                    num_none += 1
+                    continue
+                elif isinstance(ind, type(Ellipsis)):
+                    ell_ind = j
+                    continue
+
+                ind_arr = np.asarray(ind)
+                if np.issubdtype(ind_arr.dtype, np.bool_):
+                    num_bool_arr += ind_arr.ndim - 1
+                elif np.issubdtype(ind_arr.dtype, np.int_):
+                    num_int_arr = (
+                        ind_arr.ndim if ind_arr.ndim > num_int_arr else num_int_arr
+                    )
+                    pos_int_arr.append(j)
+
+            if a.ndim == len(pos_int_arr) + num_int:
+                # all dimensions indexed with integer arrays or integers
+                out_ind = np.ravel_multi_index(inds, a.shape, mode="wrap")
+
+            else:
+                # expand ellipsis or add omitted trailing slices
+                missing_dims = a.ndim - num_bool_arr - len(inds) + num_none
+                if ell_ind != -1:
+                    if missing_dims:
+                        # ellipsis must be expanded into >1 slice
+                        inds = (
+                            inds[:ell_ind]
+                            + [slice(None)] * (missing_dims + 1)
+                            + inds[ell_ind + 1 :]
+                        )
+                        pos_int_arr = [
+                            j + missing_dims if j > ell_ind else j
+                            for j in pos_int_arr
+                        ]
+                    else:
+                        # ellipsis acting as a single slice
+                        inds[ell_ind] = slice(None)
+                elif missing_dims:
+                    inds += [slice(None)] * missing_dims
+
+                # whether all integer arrays next to one another or not
+                # determines how new dims added to int array indices
+                if len(pos_int_arr):
+                    contig_int_arr = bool(
+                        len(pos_int_arr) == pos_int_arr[-1] - pos_int_arr[0] + 1
+                    )
+                    if not contig_int_arr:
+                        diffs = [
+                            i - j - 1
+                            for i, j in zip(pos_int_arr[1:], pos_int_arr[:-1])
+                        ]
+
+                offset = 0
+                out_ind = []
+
+                for j, ind in enumerate(inds[::-1]):
+                    if ind is None:
+                        # any newaxis objects can be ignored due to later ravel
+                        pass
+
+                    elif isinstance(ind, int):
+                        # integers will get broadcast out by ravel_multi_index
+                        out_ind.append(ind)
+                        offset += 1
+
+                    elif isinstance(ind, slice):
+                        # convert slice to arange for appropriate dimension
+                        star = 0 if ind.start is None else ind.start
+                        stop = (
+                            a.shape[-len(out_ind) - 1]
+                            if ind.stop is None
+                            else ind.stop
+                        )
+                        step = 1 if ind.step is None else ind.step
+
+                        out_ind.append(
+                            np.arange(star, stop, step).reshape(
+                                (-1,) + (1,) * offset
+                            )
+                        )
+                        offset += 1
+
+                    else:
+                        ind = np.asarray(ind)
+
+                        if np.issubdtype(ind.dtype, np.bool_):
+                            # can simply find the Trues in a boolean array
+                            non_zero_bools = np.nonzero(ind)
+                            for dim_inds in non_zero_bools:
+                                out_ind.append(
+                                    dim_inds.reshape((-1,) + (1,) * offset)
+                                )
+                                offset += 1
+
+                        else:
+                            if contig_int_arr:
+                                # integer arrays must already be broadcast compatible with
+                                # one another, so simply add trailing 1-dims
+                                # can ignore any leading 1-dims, as these will broadcast out
+                                # as needed or be undone in the subsequent ravel
+                                out_ind.append(
+                                    ind.reshape(ind.shape + (1,) * offset)
+                                )
+                                if a.ndim - j - 1 == pos_int_arr[0]:
+                                    offset += num_int_arr
+                            else:
+                                # add trailing indices for integer arrays
+                                broadcast_shape = (1,) * (
+                                    a.ndim
+                                    - pos_int_arr[-1]
+                                    - num_bool_arr
+                                    + num_none
+                                    - 1
+                                    )
+
+                                for i, d in zip(ind.shape[::-1], diffs[::-1]):
+                                    # insert 1-dims between dimensions index with int arrays
+                                    broadcast_shape += (i,) + (1,) * d
+
+                                ind = ind.reshape(
+                                    ind.shape[: -len(diffs)]
+                                    + (1,) * (len(inds) - num_none + num_bool_arr)
+                                    + broadcast_shape[::-1]
+                                )
+                                out_ind.append(ind)
+                                offset += 1
+                out_ind = np.ravel_multi_index(out_ind[::-1], a.shape, mode="wrap")
+
+            out = np.bincount(
+                out_ind.ravel(), weights=grad.ravel(), minlength=a.size
+            ).reshape(a.shape)
         return out
 
 
